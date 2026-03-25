@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ninja Hands</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; cursor: none; }
+canvas { display: block; width: 100vw; height: 100vh; }
+video { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" playsinline></video>
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+const FINGERTIPS = [4, 8, 12, 16, 20];
+const GRAB_TIPS = [8, 12, 16, 20];
+const GRAB_THRESHOLD = 0.10;
+const RELEASE_THRESHOLD = 0.13;
+
+const FRUITS = ["🍎","🍊","🍋","🍇","🍓","🍑","🍒","🍌","🥝","🍍"];
+const FRUIT_COLORS = {
+  "🍎": ["#ff2222","#cc0000","#ff6644"],
+  "🍊": ["#ff8800","#cc6600","#ffaa33"],
+  "🍋": ["#ffee00","#ccbb00","#ffff55"],
+  "🍇": ["#8833ff","#6611cc","#aa55ff"],
+  "🍓": ["#ff0055","#cc0044","#ff4477"],
+  "🍑": ["#ffaa88","#dd8866","#ffccaa"],
+  "🍒": ["#cc0011","#990000","#ee3333"],
+  "🍌": ["#ffee00","#ddcc00","#ffff44"],
+  "🥝": ["#77bb00","#559900","#99dd22"],
+  "🍍": ["#ffcc00","#dd9900","#ffdd44"],
+};
+
+const PHASES = [
+  { dur: 30, interval: 1800, maxObj: 3, speed: 1.0, bombW: 0.15, starW: 0.00 },
+  { dur: 30, interval: 1300, maxObj: 5, speed: 1.3, bombW: 0.22, starW: 0.03 },
+  { dur: 30, interval: 900,  maxObj: 7, speed: 1.6, bombW: 0.27, starW: 0.07 },
+  { dur: 999, interval: 550, maxObj: 10, speed: 2.0, bombW: 0.30, starW: 0.10 },
+];
+
+const State = {
+  LOADING: 0,
+  READY: 1,
+  CAMERA: 2,
+  CALIBRATION: 3,
+  COUNTDOWN: 4,
+  PLAYING: 5,
+  GAMEOVER: 6,
+};
+
+// ============================================================
+// DOM & CANVAS
+// ============================================================
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("v");
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ============================================================
+// GAME STATE
+// ============================================================
+
+let state = State.LOADING;
+let handLandmarker = null;
+let audioCtx = null;
+let lastDetectTime = -1;
+let detectedHands = [];
+
+let score = 0;
+let lives = 3;
+let combo = 0;
+let peakCombo = 0;
+let gameTime = 0;
+let spawnTimer = 0;
+let objects = [];
+let particles = [];
+let comboPopups = [];
+let shakeIntensity = 0;
+let flashAlpha = 0;
+let slowMoTimer = 0;
+let timeScale = 1;
+let countdownVal = 3;
+let countdownStart = 0;
+let calibGrabs = 0;
+let calibHandSeen = 0;
+let prevGrabState = [false, false];
+let titlePulse = 0;
+let loadingDots = 0;
+
+// ============================================================
+// AUDIO
+// ============================================================
+
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+
+function playTone(freq, dur, type = "sine", vol = 0.2, freqEnd = null) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  const t = audioCtx.currentTime;
+  osc.frequency.setValueAtTime(freq, t);
+  if (freqEnd != null) osc.frequency.linearRampToValueAtTime(freqEnd, t + dur);
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  osc.start(t);
+  osc.stop(t + dur + 0.01);
+}
+
+function sfxPop() { playTone(800, 0.08, "sine", 0.25); }
+function sfxStar() {
+  playTone(1000, 0.1, "sine", 0.18);
+  setTimeout(() => playTone(1200, 0.1, "sine", 0.18), 50);
+  setTimeout(() => playTone(1500, 0.12, "sine", 0.18), 100);
+}
+function sfxBomb() {
+  playTone(100, 0.25, "sawtooth", 0.35, 30);
+  playTone(60, 0.3, "square", 0.15, 20);
+}
+function sfxCombo(c) { playTone(400 + c * 50, 0.1, "triangle", 0.18); }
+function sfxWhoosh() { playTone(300, 0.15, "sine", 0.08, 600); }
+function sfxLife() { playTone(200, 0.3, "sawtooth", 0.2, 80); }
+
+// ============================================================
+// PARTICLES
+// ============================================================
+
+function spawnParticles(x, y, colors, count = 20) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 6;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1,
+      decay: 0.015 + Math.random() * 0.02,
+      size: 3 + Math.random() * 5,
+      color: colors[Math.floor(Math.random() * colors.length)],
+    });
+  }
+}
+
+function spawnConfetti(x, y, count = 40) {
+  const colors = ["#ff0055","#00ccff","#ffee00","#00ff88","#ff8800","#aa44ff"];
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 3 + Math.random() * 8;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 3,
+      life: 1,
+      decay: 0.008 + Math.random() * 0.012,
+      size: 4 + Math.random() * 6,
+      color: colors[Math.floor(Math.random() * colors.length)],
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 0.15 * dt;
+    p.life -= p.decay * dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    const s = p.size * p.life;
+    ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
+// HAND TRACKING HELPERS
+// ============================================================
+
+function isGrabbing(landmarks, prevGrab) {
+  const palm = landmarks[9];
+  let totalDist = 0;
+  for (const tip of GRAB_TIPS) {
+    const dx = landmarks[tip].x - palm.x;
+    const dy = landmarks[tip].y - palm.y;
+    totalDist += Math.sqrt(dx * dx + dy * dy);
+  }
+  const avg = totalDist / GRAB_TIPS.length;
+  if (prevGrab) return avg < RELEASE_THRESHOLD;
+  return avg < GRAB_THRESHOLD;
+}
+
+function handCenter(landmarks) {
+  return {
+    x: (1 - landmarks[9].x) * canvas.width,
+    y: landmarks[9].y * canvas.height,
+  };
+}
+
+function mirrorLandmark(lm) {
+  return { x: (1 - lm.x) * canvas.width, y: lm.y * canvas.height };
+}
+
+function drawHandSkeleton(landmarks, grabbing) {
+  const color = grabbing ? "#00ff88" : "#00aaff";
+  const glow = grabbing ? 18 + Math.sin(performance.now() / 80) * 8 : 0;
+
+  ctx.save();
+  if (grabbing) {
+    ctx.shadowColor = "#00ff88";
+    ctx.shadowBlur = glow;
+  }
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  for (const [a, b] of HAND_CONNECTIONS) {
+    const pa = mirrorLandmark(landmarks[a]);
+    const pb = mirrorLandmark(landmarks[b]);
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < 21; i++) {
+    const p = mirrorLandmark(landmarks[i]);
+    const isTip = FINGERTIPS.includes(i);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, isTip ? 7 : 4, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ============================================================
+// OBJECT MANAGEMENT
+// ============================================================
+
+function getPhase() {
+  let elapsed = 0;
+  for (let i = 0; i < PHASES.length; i++) {
+    elapsed += PHASES[i].dur;
+    if (gameTime < elapsed) return PHASES[i];
+  }
+  return PHASES[PHASES.length - 1];
+}
+
+function spawnObject() {
+  const phase = getPhase();
+  if (objects.length >= phase.maxObj) return;
+
+  const W = canvas.width;
+  const H = canvas.height;
+  const edge = Math.random();
+  let x, y, vx, vy;
+
+  if (edge < 0.3) {
+    x = -50; y = H * 0.2 + Math.random() * H * 0.6;
+    vx = (2 + Math.random() * 3) * phase.speed;
+    vy = (Math.random() - 0.5) * 2 * phase.speed;
+  } else if (edge < 0.6) {
+    x = W + 50; y = H * 0.2 + Math.random() * H * 0.6;
+    vx = -(2 + Math.random() * 3) * phase.speed;
+    vy = (Math.random() - 0.5) * 2 * phase.speed;
+  } else if (edge < 0.85) {
+    x = W * 0.15 + Math.random() * W * 0.7;
+    y = H + 50;
+    vx = (Math.random() - 0.5) * 3 * phase.speed;
+    vy = -(4 + Math.random() * 3) * phase.speed;
+  } else {
+    x = W * 0.15 + Math.random() * W * 0.7;
+    y = -50;
+    vx = (Math.random() - 0.5) * 2 * phase.speed;
+    vy = (1.5 + Math.random() * 2) * phase.speed;
+  }
+
+  const roll = Math.random();
+  const fruitW = 1 - phase.bombW - phase.starW;
+  let type, emoji, points, size;
+
+  if (roll < fruitW) {
+    type = "fruit";
+    emoji = FRUITS[Math.floor(Math.random() * FRUITS.length)];
+    points = 10;
+    size = 50;
+  } else if (roll < fruitW + phase.bombW) {
+    type = "bomb";
+    emoji = "\uD83D\uDCA3";
+    points = -30;
+    size = 45;
+  } else {
+    type = "star";
+    emoji = "\u2B50";
+    points = 50;
+    size = 40;
+  }
+
+  objects.push({
+    x, y, vx, vy, type, emoji, points, size,
+    radius: size * 0.6,
+    rotation: Math.random() * Math.PI * 2,
+    rotSpeed: (Math.random() - 0.5) * 0.08,
+    alive: true,
+    caught: false,
+    catchScale: 1,
+    nearMissPlayed: false,
+  });
+}
+
+function updateObjects(dt) {
+  const gravity = 0.12;
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const o = objects[i];
+    o.x += o.vx * timeScale * dt;
+    o.y += o.vy * timeScale * dt;
+    o.vy += gravity * timeScale * dt;
+    o.rotation += o.rotSpeed * timeScale * dt;
+
+    if (o.caught) {
+      o.catchScale *= 0.85;
+      if (o.catchScale < 0.1) {
+        objects.splice(i, 1);
+        continue;
+      }
+    }
+
+    const margin = 120;
+    if (o.x < -margin || o.x > canvas.width + margin ||
+        o.y < -margin || o.y > canvas.height + margin) {
+      objects.splice(i, 1);
+    }
+  }
+}
+
+function drawObjects() {
+  for (const o of objects) {
+    if (o.caught) {
+      ctx.globalAlpha = o.catchScale;
+    }
+
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(o.rotation);
+    const s = o.size * (o.caught ? o.catchScale : 1);
+
+    if (o.type === "star") {
+      ctx.shadowColor = "#ffcc00";
+      ctx.shadowBlur = 15 + Math.sin(performance.now() / 120) * 5;
+    }
+    if (o.type === "bomb") {
+      ctx.shadowColor = "#ff4400";
+      ctx.shadowBlur = 8;
+    }
+
+    ctx.font = `${s}px serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(o.emoji, 0, 0);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+// COLLISION + CATCHING
+// ============================================================
+
+function processHands(results, timestamp) {
+  detectedHands = [];
+  if (!results || !results.landmarks) return;
+
+  for (let i = 0; i < results.landmarks.length; i++) {
+    const lm = results.landmarks[i];
+    const grabbing = isGrabbing(lm, prevGrabState[i] || false);
+    const justGrabbed = grabbing && !prevGrabState[i];
+    prevGrabState[i] = grabbing;
+
+    const center = handCenter(lm);
+    let handedness = "Unknown";
+    if (results.handedness && results.handedness[i] && results.handedness[i][0]) {
+      handedness = results.handedness[i][0].categoryName;
+    }
+
+    detectedHands.push({
+      landmarks: lm,
+      grabbing,
+      justGrabbed,
+      x: center.x,
+      y: center.y,
+      handedness,
+    });
+  }
+}
+
+function checkCatches() {
+  let caughtThisFrame = 0;
+  let handsWithCatch = 0;
+  const handCaught = [false, false];
+
+  for (let hi = 0; hi < detectedHands.length; hi++) {
+    const hand = detectedHands[hi];
+    if (!hand.grabbing) continue;
+
+    for (const obj of objects) {
+      if (obj.caught || !obj.alive) continue;
+      const dx = hand.x - obj.x;
+      const dy = hand.y - obj.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (dist < obj.radius + 45) {
+        obj.caught = true;
+        obj.alive = false;
+
+        if (obj.type === "fruit") {
+          const mult = Math.max(1, Math.floor(combo / 5) + 1);
+          const pts = obj.points * mult;
+          score += pts;
+          combo++;
+          if (combo > peakCombo) peakCombo = combo;
+          caughtThisFrame++;
+          handCaught[hi] = true;
+          sfxPop();
+          sfxCombo(combo);
+          const colors = FRUIT_COLORS[obj.emoji] || ["#ffffff"];
+          spawnParticles(obj.x, obj.y, colors, 18);
+          comboPopups.push({
+            x: hand.x, y: hand.y - 40,
+            text: combo >= 2 ? `x${combo}` : `+${pts}`,
+            life: 1, scale: 1 + Math.min(combo, 15) * 0.06,
+            color: combo >= 5 ? "#ffee00" : "#00ff88",
+          });
+          if (combo % 5 === 0) spawnConfetti(hand.x, hand.y, 30);
+          if (combo % 10 === 0) spawnConfetti(canvas.width / 2, canvas.height / 2, 60);
+        } else if (obj.type === "bomb") {
+          score += obj.points;
+          lives--;
+          combo = 0;
+          sfxBomb();
+          sfxLife();
+          shakeIntensity = 20;
+          flashAlpha = 0.45;
+          spawnParticles(obj.x, obj.y, ["#ff2200","#ff6600","#ffaa00","#ff0000"], 30);
+        } else if (obj.type === "star") {
+          const mult = Math.max(1, Math.floor(combo / 5) + 1);
+          score += obj.points * mult;
+          combo++;
+          if (combo > peakCombo) peakCombo = combo;
+          caughtThisFrame++;
+          handCaught[hi] = true;
+          sfxStar();
+          slowMoTimer = 120;
+          spawnParticles(obj.x, obj.y, ["#ffdd00","#ffee66","#ffffff"], 25);
+          comboPopups.push({
+            x: hand.x, y: hand.y - 40,
+            text: `STAR +${obj.points * mult}`,
+            life: 1.5, scale: 1.5, color: "#ffdd00",
+          });
+        }
+      }
+    }
+  }
+
+  // Both-hands bonus
+  if (handCaught[0] && handCaught[1]) {
+    score += 20;
+    comboPopups.push({
+      x: canvas.width / 2, y: canvas.height / 2 - 80,
+      text: "DOUBLE +20", life: 1.5, scale: 1.6, color: "#ff00ff",
+    });
+    sfxCombo(20);
+  }
+
+  // Near-miss whoosh
+  for (const hand of detectedHands) {
+    if (hand.grabbing) continue;
+    for (const obj of objects) {
+      if (obj.caught || obj.nearMissPlayed) continue;
+      const dx = hand.x - obj.x;
+      const dy = hand.y - obj.y;
+      if (Math.sqrt(dx * dx + dy * dy) < obj.radius + 80) {
+        obj.nearMissPlayed = true;
+        sfxWhoosh();
+      }
+    }
+  }
+}
+
+// ============================================================
+// COMBO POPUPS
+// ============================================================
+
+function updatePopups(dt) {
+  for (let i = comboPopups.length - 1; i >= 0; i--) {
+    const p = comboPopups[i];
+    p.y -= 1.2 * dt;
+    p.life -= 0.025 * dt;
+    if (p.life <= 0) comboPopups.splice(i, 1);
+  }
+}
+
+function drawPopups() {
+  for (const p of comboPopups) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+    ctx.save();
+    ctx.font = `bold ${Math.round(28 * p.scale)}px monospace`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = p.color;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = "#fff";
+    ctx.fillText(p.text, p.x, p.y);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+// UI RENDERING
+// ============================================================
+
+function drawScore() {
+  ctx.save();
+  ctx.shadowColor = "#0ff";
+  ctx.shadowBlur = 20;
+  ctx.font = "bold 52px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#fff";
+  ctx.fillText(String(score), canvas.width / 2, 18);
+  ctx.shadowBlur = 0;
+
+  // Lives
+  ctx.font = "30px serif";
+  ctx.textAlign = "left";
+  for (let i = 0; i < 3; i++) {
+    ctx.globalAlpha = i < lives ? 1 : 0.2;
+    ctx.fillText("\u2764\uFE0F", 20 + i * 38, 22);
+  }
+  ctx.globalAlpha = 1;
+
+  // Combo
+  if (combo >= 2) {
+    ctx.font = `bold ${24 + Math.min(combo, 20) * 2}px monospace`;
+    ctx.textAlign = "right";
+    ctx.shadowColor = combo >= 10 ? "#ffee00" : "#00ff88";
+    ctx.shadowBlur = 10;
+    ctx.fillStyle = combo >= 10 ? "#ffee00" : "#00ff88";
+    ctx.fillText(`x${combo}`, canvas.width - 20, 28);
+    ctx.shadowBlur = 0;
+  }
+
+  // Phase indicator
+  const phase = getPhaseIndex();
+  if (phase >= 3) {
+    ctx.font = "bold 18px monospace";
+    ctx.textAlign = "center";
+    ctx.fillStyle = `hsl(${(performance.now() / 5) % 360}, 100%, 60%)`;
+    ctx.fillText("CHAOS MODE", canvas.width / 2, 78);
+  }
+
+  // Time
+  ctx.font = "16px monospace";
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#aaa";
+  ctx.fillText(`${Math.floor(gameTime)}s`, canvas.width - 20, 68);
+
+  ctx.restore();
+}
+
+function getPhaseIndex() {
+  let elapsed = 0;
+  for (let i = 0; i < PHASES.length; i++) {
+    elapsed += PHASES[i].dur;
+    if (gameTime < elapsed) return i;
+  }
+  return PHASES.length - 1;
+}
+
+function drawBombTrails() {
+  for (const o of objects) {
+    if (o.type !== "bomb" || o.caught) continue;
+    if (Math.random() < 0.4) {
+      particles.push({
+        x: o.x + (Math.random() - 0.5) * 10,
+        y: o.y + (Math.random() - 0.5) * 10,
+        vx: (Math.random() - 0.5) * 1.5,
+        vy: Math.random() * -1,
+        life: 0.6,
+        decay: 0.03,
+        size: 3 + Math.random() * 3,
+        color: Math.random() > 0.5 ? "#ff4400" : "#882200",
+      });
+    }
+  }
+}
+
+// ============================================================
+// SCREEN EFFECTS
+// ============================================================
+
+function applyScreenEffects() {
+  if (flashAlpha > 0.01) {
+    ctx.fillStyle = `rgba(255, 0, 0, ${flashAlpha})`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    flashAlpha *= 0.88;
+  }
+}
+
+// ============================================================
+// STATE SCREENS
+// ============================================================
+
+function drawLoadingScreen() {
+  loadingDots += 0.03;
+  const dots = ".".repeat(Math.floor(loadingDots % 4));
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.font = "bold 72px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = "#ff0066";
+  ctx.shadowBlur = 30;
+  ctx.fillStyle = "#fff";
+  ctx.fillText("NINJA HANDS", canvas.width / 2, canvas.height / 2 - 50);
+  ctx.shadowBlur = 0;
+
+  ctx.font = "24px monospace";
+  ctx.fillStyle = "#888";
+  ctx.fillText(`Loading hand tracker${dots}`, canvas.width / 2, canvas.height / 2 + 30);
+  ctx.restore();
+}
+
+function drawReadyScreen() {
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  titlePulse += 0.04;
+
+  ctx.save();
+  const glow = 20 + Math.sin(titlePulse) * 10;
+  ctx.font = "bold 80px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = "#ff0066";
+  ctx.shadowBlur = glow;
+  ctx.fillStyle = "#fff";
+  ctx.fillText("NINJA HANDS", canvas.width / 2, canvas.height / 2 - 60);
+  ctx.shadowBlur = 0;
+
+  ctx.font = "28px monospace";
+  ctx.fillStyle = "#0ff";
+  ctx.fillText("Click anywhere to start", canvas.width / 2, canvas.height / 2 + 30);
+
+  ctx.font = "18px monospace";
+  ctx.fillStyle = "#666";
+  ctx.fillText("Catch fruit \uD83C\uDF4E   Dodge bombs \uD83D\uDCA3   Grab stars \u2B50", canvas.width / 2, canvas.height / 2 + 80);
+  ctx.restore();
+}
+
+function drawCameraSetupScreen() {
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.font = "28px monospace";
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#888";
+  ctx.fillText("Setting up camera...", canvas.width / 2, canvas.height / 2);
+}
+
+function drawCalibration() {
+  drawMirroredVideo();
+  for (const hand of detectedHands) {
+    drawHandSkeleton(hand.landmarks, hand.grabbing);
+  }
+
+  ctx.save();
+  ctx.font = "bold 36px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = "#0ff";
+  ctx.shadowBlur = 15;
+  ctx.fillStyle = "#fff";
+
+  if (detectedHands.length === 0) {
+    ctx.fillText("Hold up your hands!", canvas.width / 2, canvas.height - 80);
+  } else if (calibGrabs < 2) {
+    ctx.fillText("Open and close your fists to test", canvas.width / 2, canvas.height - 80);
+    ctx.font = "22px monospace";
+    ctx.fillStyle = "#aaa";
+    ctx.fillText(`(${calibGrabs}/2)`, canvas.width / 2, canvas.height - 40);
+  }
+  ctx.restore();
+}
+
+function drawCountdown() {
+  drawMirroredVideo();
+  for (const hand of detectedHands) {
+    drawHandSkeleton(hand.landmarks, hand.grabbing);
+  }
+
+  const elapsed = (performance.now() - countdownStart) / 1000;
+  const val = 3 - Math.floor(elapsed);
+
+  ctx.save();
+  ctx.font = "bold 160px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const frac = elapsed % 1;
+  const scale = 1 + (1 - frac) * 0.3;
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.scale(scale, scale);
+  ctx.shadowColor = "#ff0066";
+  ctx.shadowBlur = 30;
+  ctx.fillStyle = "#fff";
+  ctx.globalAlpha = 0.6 + frac * 0.4;
+
+  if (val > 0) {
+    ctx.fillText(String(val), 0, 0);
+  } else {
+    ctx.font = "bold 100px monospace";
+    ctx.fillText("GO!", 0, 0);
+  }
+  ctx.restore();
+}
+
+function drawGameOver() {
+  drawMirroredVideo();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  ctx.font = "bold 72px monospace";
+  ctx.shadowColor = "#ff0044";
+  ctx.shadowBlur = 25;
+  ctx.fillStyle = "#fff";
+  ctx.fillText("GAME OVER", cx, cy - 100);
+  ctx.shadowBlur = 0;
+
+  ctx.font = "bold 48px monospace";
+  ctx.fillStyle = "#0ff";
+  ctx.fillText(String(score), cx, cy - 20);
+
+  ctx.font = "22px monospace";
+  ctx.fillStyle = "#aaa";
+  ctx.fillText(`Peak combo: x${peakCombo}`, cx, cy + 35);
+  ctx.fillText(`Survived: ${Math.floor(gameTime)}s`, cx, cy + 65);
+
+  ctx.font = "24px monospace";
+  ctx.fillStyle = "#0ff";
+  ctx.fillText("Click to play again", cx, cy + 130);
+  ctx.restore();
+}
+
+// ============================================================
+// WEBCAM DRAWING
+// ============================================================
+
+function drawMirroredVideo() {
+  if (!video.videoWidth) return;
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  // slight darken for contrast
+  ctx.fillStyle = "rgba(0,0,0,0.15)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+// ============================================================
+// GAME RESET
+// ============================================================
+
+function resetGame() {
+  score = 0;
+  lives = 3;
+  combo = 0;
+  peakCombo = 0;
+  gameTime = 0;
+  spawnTimer = 0;
+  objects = [];
+  particles = [];
+  comboPopups = [];
+  shakeIntensity = 0;
+  flashAlpha = 0;
+  slowMoTimer = 0;
+  timeScale = 1;
+  prevGrabState = [false, false];
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+let lastFrameTime = 0;
+
+function gameLoop(timestamp) {
+  requestAnimationFrame(gameLoop);
+
+  const rawDt = lastFrameTime ? (timestamp - lastFrameTime) / 16.667 : 1;
+  const dt = Math.min(rawDt, 3); // cap to avoid huge jumps
+  lastFrameTime = timestamp;
+
+  // Hand detection
+  if (handLandmarker && video.readyState >= 2 && timestamp > lastDetectTime) {
+    lastDetectTime = timestamp;
+    try {
+      const results = handLandmarker.detectForVideo(video, timestamp);
+      processHands(results, timestamp);
+    } catch (e) {
+      // skip frame on detection error
+    }
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  switch (state) {
+    case State.LOADING:
+      drawLoadingScreen();
+      break;
+
+    case State.READY:
+      drawReadyScreen();
+      break;
+
+    case State.CAMERA:
+      drawCameraSetupScreen();
+      break;
+
+    case State.CALIBRATION: {
+      // Check for grab transitions
+      for (let i = 0; i < detectedHands.length; i++) {
+        if (detectedHands[i].justGrabbed) calibGrabs++;
+      }
+      if (calibGrabs >= 2) {
+        state = State.COUNTDOWN;
+        countdownStart = performance.now();
+        calibGrabs = 0;
+      }
+      drawCalibration();
+      break;
+    }
+
+    case State.COUNTDOWN: {
+      const elapsed = (performance.now() - countdownStart) / 1000;
+      if (elapsed > 3.6) {
+        state = State.PLAYING;
+        resetGame();
+      }
+      drawCountdown();
+      break;
+    }
+
+    case State.PLAYING: {
+      // Timing
+      gameTime += (1 / 60) * dt * timeScale;
+      if (slowMoTimer > 0) {
+        timeScale = 0.3;
+        slowMoTimer -= dt;
+      } else {
+        timeScale = 1;
+      }
+
+      // Spawning
+      const phase = getPhase();
+      spawnTimer += (16.667 * dt);
+      if (spawnTimer >= phase.interval) {
+        spawnTimer -= phase.interval;
+        const numSpawn = getPhaseIndex() >= 3 ? (Math.random() < 0.3 ? 2 : 1) : 1;
+        for (let i = 0; i < numSpawn; i++) spawnObject();
+      }
+
+      // Update
+      updateObjects(dt);
+      drawBombTrails();
+      updateParticles(dt);
+      updatePopups(dt);
+      checkCatches();
+
+      // Check game over
+      if (lives <= 0) {
+        state = State.GAMEOVER;
+        break;
+      }
+
+      // Shake offset
+      ctx.save();
+      if (shakeIntensity > 0.5) {
+        ctx.translate(
+          (Math.random() - 0.5) * shakeIntensity,
+          (Math.random() - 0.5) * shakeIntensity
+        );
+        shakeIntensity *= 0.88;
+      }
+
+      // Render
+      drawMirroredVideo();
+      for (const hand of detectedHands) {
+        drawHandSkeleton(hand.landmarks, hand.grabbing);
+      }
+      drawObjects();
+      drawParticles();
+      drawPopups();
+      drawScore();
+      applyScreenEffects();
+
+      // Slow-mo overlay tint
+      if (slowMoTimer > 0) {
+        ctx.fillStyle = "rgba(0, 100, 255, 0.06)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      ctx.restore();
+      break;
+    }
+
+    case State.GAMEOVER:
+      updateParticles(dt);
+      drawGameOver();
+      drawParticles();
+      break;
+  }
+}
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
+
+async function initHandTracker() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",
+    },
+    numHands: 2,
+    runningMode: "VIDEO",
+  });
+}
+
+async function startCamera() {
+  state = State.CAMERA;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+    });
+    video.srcObject = stream;
+    await video.play();
+    state = State.CALIBRATION;
+  } catch (err) {
+    console.error("Camera error:", err);
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.font = "24px monospace";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff4444";
+    ctx.fillText("Camera access denied. Refresh and allow camera.", canvas.width / 2, canvas.height / 2);
+  }
+}
+
+// Click handler
+document.addEventListener("click", () => {
+  ensureAudio();
+  if (state === State.READY) {
+    startCamera();
+  } else if (state === State.GAMEOVER) {
+    resetGame();
+    state = State.COUNTDOWN;
+    countdownStart = performance.now();
+  }
+});
+
+// Kick off
+(async () => {
+  requestAnimationFrame(gameLoop);
+  try {
+    await initHandTracker();
+    state = State.READY;
+  } catch (err) {
+    console.error("MediaPipe init failed:", err);
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.font = "24px monospace";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff4444";
+    ctx.fillText("Failed to load hand tracker. Try Chrome.", canvas.width / 2, canvas.height / 2);
+  }
+})();
+
+</script>
+</body>
+</html>
