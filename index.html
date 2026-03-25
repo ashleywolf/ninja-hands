@@ -495,17 +495,17 @@ function spawnObject() {
     type = "fruit";
     emoji = FRUITS[Math.floor(Math.random() * FRUITS.length)];
     points = 10;
-    size = 50;
+    size = 80;
   } else if (roll < fruitW + phase.bombW) {
     type = "bomb";
     emoji = "\uD83D\uDCA3";
     points = -30;
-    size = 45;
+    size = 70;
   } else {
     type = "star";
     emoji = "\u2B50";
     points = 50;
-    size = 40;
+    size = 65;
   }
 
   objects.push({
@@ -550,11 +550,11 @@ function spawnFrenzyObject() {
   if (Math.random() < 0.8) {
     type = "fruit";
     emoji = FRUITS[Math.floor(Math.random() * FRUITS.length)];
-    points = 10; size = 50;
+    points = 10; size = 80;
   } else {
     type = "bomb";
     emoji = "\uD83D\uDCA3";
-    points = -30; size = 45;
+    points = -30; size = 70;
   }
 
   objects.push({
@@ -602,13 +602,38 @@ function drawObjects() {
     ctx.rotate(o.rotation);
     const s = o.size * (o.caught ? o.catchScale : 1);
 
+    // glowing disc behind each object so it's visible against webcam
+    const glowR = s * 0.55;
+    if (o.type === "fruit") {
+      const grad = ctx.createRadialGradient(0, 0, glowR * 0.2, 0, 0, glowR);
+      grad.addColorStop(0, "rgba(255,255,255,0.35)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+      ctx.fill();
+    }
     if (o.type === "star") {
       ctx.shadowColor = "#ffcc00";
-      ctx.shadowBlur = 15 + Math.sin(performance.now() / 120) * 5;
+      ctx.shadowBlur = 20 + Math.sin(performance.now() / 120) * 8;
+      const grad = ctx.createRadialGradient(0, 0, glowR * 0.2, 0, 0, glowR);
+      grad.addColorStop(0, "rgba(255,204,0,0.4)");
+      grad.addColorStop(1, "rgba(255,204,0,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+      ctx.fill();
     }
     if (o.type === "bomb") {
       ctx.shadowColor = "#ff4400";
-      ctx.shadowBlur = 8;
+      ctx.shadowBlur = 12;
+      const grad = ctx.createRadialGradient(0, 0, glowR * 0.2, 0, 0, glowR);
+      grad.addColorStop(0, "rgba(255,68,0,0.3)");
+      grad.addColorStop(1, "rgba(255,68,0,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+      ctx.fill();
     }
 
     ctx.font = `${s}px serif`;
@@ -1289,8 +1314,8 @@ function drawMirroredVideo() {
   ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
   ctx.restore();
 
-  // slight darken for contrast
-  ctx.fillStyle = "rgba(0,0,0,0.15)";
+  // darken webcam so fruit pops
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
 
