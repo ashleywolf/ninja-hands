@@ -9,11 +9,30 @@
 body { background: #000; overflow: hidden; cursor: none; }
 canvas { display: block; width: 100vw; height: 100vh; }
 video { display: none; }
+#username-wrap {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  display: none; z-index: 10; align-items: center; gap: 8px;
+}
+#avatar-preview {
+  width: 36px; height: 36px; border-radius: 50%; border: 2px solid #444;
+  background: #222; display: none; object-fit: cover;
+}
+#github-input {
+  background: #1a1a2e; color: #ccc; border: 1px solid #444;
+  border-radius: 8px; padding: 6px 12px; font: 14px monospace;
+  width: 200px; outline: none; cursor: text;
+}
+#github-input:focus { border-color: #0ff; }
+#github-input::placeholder { color: #555; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <video id="v" playsinline></video>
+<div id="username-wrap">
+  <img id="avatar-preview" alt="">
+  <input id="github-input" type="text" placeholder="GitHub username" autocomplete="off" spellcheck="false">
+</div>
 <script type="module">
 import { HandLandmarker, FilesetResolver }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
@@ -73,6 +92,9 @@ const State = {
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
 const video = document.getElementById("v");
+const usernameWrap = document.getElementById("username-wrap");
+const githubInput = document.getElementById("github-input");
+const avatarPreview = document.getElementById("avatar-preview");
 
 function resize() {
   canvas.width = window.innerWidth;
@@ -120,6 +142,94 @@ try {
   const saved = JSON.parse(localStorage.getItem('ninjaHands_highScore'));
   if (saved) { highScore = saved.score || 0; highCombo = saved.combo || 0; }
 } catch(e) {}
+
+// GitHub username (shared across games)
+let githubUsername = localStorage.getItem('github_username') || '';
+if (githubUsername) {
+  githubInput.value = githubUsername;
+  avatarPreview.src = `https://github.com/${githubUsername}.png?size=40`;
+  avatarPreview.style.display = 'block';
+}
+
+// Leaderboard
+let leaderboard = [];
+try {
+  const lb = JSON.parse(localStorage.getItem('ninjaHands_leaderboard'));
+  if (Array.isArray(lb)) leaderboard = lb;
+} catch(e) {}
+
+let scoreSaved = false;
+const avatarCache = {};
+
+function getAvatarUrl(username, size) {
+  if (!username) return null;
+  return `https://github.com/${username}.png?size=${size}`;
+}
+
+function loadAvatarImage(username, size) {
+  const key = `${username}_${size}`;
+  if (avatarCache[key]) return avatarCache[key];
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.src = getAvatarUrl(username, size);
+  img.onerror = () => { img._failed = true; };
+  avatarCache[key] = img;
+  return img;
+}
+
+function scoreQualifies(s) {
+  if (leaderboard.length < 10) return true;
+  return s > leaderboard[leaderboard.length - 1].score;
+}
+
+function saveScore() {
+  if (scoreSaved) return;
+  const entry = {
+    username: githubUsername || '',
+    avatar: githubUsername ? getAvatarUrl(githubUsername, 48) : '',
+    score: score,
+    bestCombo: peakCombo,
+    date: new Date().toISOString(),
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  };
+  leaderboard.push(entry);
+  leaderboard.sort((a, b) => b.score - a.score);
+  if (leaderboard.length > 10) leaderboard.length = 10;
+  try { localStorage.setItem('ninjaHands_leaderboard', JSON.stringify(leaderboard)); } catch(e) {}
+  scoreSaved = true;
+}
+
+function formatLeaderboardDate(iso) {
+  try {
+    const d = new Date(iso);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[d.getMonth()]} ${d.getDate()}`;
+  } catch(e) { return ''; }
+}
+
+// Username input handlers
+let avatarDebounce = null;
+githubInput.addEventListener('input', () => {
+  const val = githubInput.value.trim();
+  githubUsername = val;
+  if (val) {
+    localStorage.setItem('github_username', val);
+  } else {
+    localStorage.removeItem('github_username');
+  }
+  clearTimeout(avatarDebounce);
+  avatarDebounce = setTimeout(() => {
+    if (val) {
+      avatarPreview.src = `https://github.com/${val}.png?size=40`;
+      avatarPreview.style.display = 'block';
+      avatarPreview.onerror = () => { avatarPreview.style.display = 'none'; };
+    } else {
+      avatarPreview.style.display = 'none';
+    }
+  }, 400);
+});
+githubInput.addEventListener('click', (e) => { e.stopPropagation(); });
+githubInput.addEventListener('mousedown', (e) => { e.stopPropagation(); });
 
 // Frenzy mode
 let frenzyTimer = 0;
@@ -798,25 +908,256 @@ function drawReadyScreen() {
   ctx.shadowColor = "#ff0066";
   ctx.shadowBlur = glow;
   ctx.fillStyle = "#fff";
-  ctx.fillText("NINJA HANDS", canvas.width / 2, canvas.height / 2 - 60);
+  ctx.fillText("NINJA HANDS", canvas.width / 2, canvas.height / 2 - 100);
   ctx.shadowBlur = 0;
 
   ctx.font = "28px monospace";
   ctx.fillStyle = "#0ff";
-  ctx.fillText("Click anywhere to start", canvas.width / 2, canvas.height / 2 + 30);
+  ctx.fillText("Click anywhere to start", canvas.width / 2, canvas.height / 2 - 10);
 
   ctx.font = "18px monospace";
   ctx.fillStyle = "#666";
-  ctx.fillText("Catch fruit \uD83C\uDF4E   Dodge bombs \uD83D\uDCA3   Grab stars \u2B50", canvas.width / 2, canvas.height / 2 + 80);
+  ctx.fillText("Catch fruit \uD83C\uDF4E   Dodge bombs \uD83D\uDCA3   Grab stars \u2B50", canvas.width / 2, canvas.height / 2 + 40);
 
   if (highScore > 0) {
     ctx.font = "20px monospace";
     ctx.fillStyle = "#ffd700";
-    ctx.fillText(`BEST: ${highScore} pts (x${highCombo} combo)`, canvas.width / 2, canvas.height / 2 + 115);
+    ctx.fillText(`BEST: ${highScore} pts (x${highCombo} combo)`, canvas.width / 2, canvas.height / 2 + 75);
+  }
+
+  // Show username input
+  usernameWrap.style.display = 'flex';
+  usernameWrap.style.top = `${Math.floor(canvas.height / 2 - 145)}px`;
+
+  // Compact leaderboard (top 5) on title screen
+  if (leaderboard.length > 0) {
+    drawCompactLeaderboard();
   }
 
   ctx.restore();
 }
+
+function drawCompactLeaderboard() {
+  const cx = canvas.width / 2;
+  const startY = canvas.height / 2 + 115;
+  const top5 = leaderboard.slice(0, 5);
+  const rowH = 28;
+  const tableW = 320;
+  const tableH = 32 + top5.length * rowH + 12;
+
+  // Border box
+  ctx.save();
+  ctx.strokeStyle = '#ffd700';
+  ctx.lineWidth = 1.5;
+  ctx.globalAlpha = 0.6;
+  ctx.strokeRect(cx - tableW / 2, startY, tableW, tableH);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(cx - tableW / 2, startY, tableW, tableH);
+  ctx.globalAlpha = 1;
+
+  // Title
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd700';
+  ctx.fillText('\uD83C\uDFC6 TOP SCORES', cx, startY + 20);
+
+  // Rows
+  ctx.font = '13px monospace';
+  ctx.textAlign = 'left';
+  for (let i = 0; i < top5.length; i++) {
+    const e = top5[i];
+    const y = startY + 38 + i * rowH;
+    const isMe = e.username && e.username === githubUsername;
+    ctx.fillStyle = isMe ? '#ffd700' : '#aaa';
+    const rank = `${i + 1}.`;
+    const name = e.username || 'Anonymous';
+    const display = name.length > 14 ? name.slice(0, 13) + '..' : name;
+    ctx.fillText(rank, cx - tableW / 2 + 12, y);
+
+    // Avatar circle
+    if (e.username) {
+      const img = loadAvatarImage(e.username, 48);
+      if (img.complete && !img._failed && img.naturalWidth > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx - tableW / 2 + 48, y - 5, 9, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.clip();
+        ctx.drawImage(img, cx - tableW / 2 + 39, y - 14, 18, 18);
+        ctx.restore();
+      } else {
+        ctx.fillStyle = '#333';
+        ctx.beginPath();
+        ctx.arc(cx - tableW / 2 + 48, y - 5, 9, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else {
+      ctx.fillStyle = '#333';
+      ctx.beginPath();
+      ctx.arc(cx - tableW / 2 + 48, y - 5, 9, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = isMe ? '#ffd700' : '#ccc';
+    ctx.fillText(display, cx - tableW / 2 + 64, y);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = isMe ? '#ffd700' : '#0ff';
+    ctx.fillText(String(e.score), cx + tableW / 2 - 12, y);
+    ctx.textAlign = 'left';
+  }
+  ctx.restore();
+}
+
+function drawGameOverLeaderboard() {
+  const cx = canvas.width / 2;
+  const startY = 280;
+  const top10 = leaderboard.slice(0, 10);
+  const rowH = 30;
+  const tableW = 520;
+  const headerH = 40;
+  const saveH = 50;
+  const tableH = headerH + top10.length * rowH + saveH + 16;
+
+  ctx.save();
+
+  // Container
+  ctx.strokeStyle = '#ffd700';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - tableW / 2, startY, tableW, tableH);
+  ctx.fillStyle = 'rgba(10, 10, 30, 0.85)';
+  ctx.fillRect(cx - tableW / 2, startY, tableW, tableH);
+
+  // Title
+  ctx.font = 'bold 18px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd700';
+  ctx.fillText('\uD83C\uDFC6 LEADERBOARD', cx, startY + 26);
+
+  // Column headers
+  const colX = {
+    rank: cx - tableW / 2 + 16,
+    avatar: cx - tableW / 2 + 48,
+    name: cx - tableW / 2 + 78,
+    score: cx + tableW / 2 - 160,
+    combo: cx + tableW / 2 - 90,
+    date: cx + tableW / 2 - 16,
+  };
+  const headY = startY + headerH + 6;
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#666';
+  ctx.textAlign = 'left';
+  ctx.fillText('#', colX.rank, headY);
+  ctx.fillText('Player', colX.name, headY);
+  ctx.textAlign = 'right';
+  ctx.fillText('Score', colX.score + 50, headY);
+  ctx.fillText('Combo', colX.combo + 40, headY);
+  ctx.fillText('Date', colX.date, headY);
+
+  // Rows
+  for (let i = 0; i < top10.length; i++) {
+    const e = top10[i];
+    const y = headY + 18 + i * rowH;
+    const isMe = scoreSaved && e.id && e.username === githubUsername &&
+                 e.score === score && e.bestCombo === peakCombo;
+
+    ctx.textAlign = 'left';
+
+    // Rank
+    ctx.font = 'bold 14px monospace';
+    ctx.fillStyle = isMe ? '#ffd700' : (i < 3 ? '#ffd700' : '#888');
+    ctx.fillText(`${i + 1}`, colX.rank, y);
+
+    // Avatar
+    if (e.username) {
+      const img = loadAvatarImage(e.username, 48);
+      if (img.complete && !img._failed && img.naturalWidth > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(colX.avatar + 2, y - 5, 12, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.clip();
+        ctx.drawImage(img, colX.avatar - 10, y - 17, 24, 24);
+        ctx.restore();
+      } else {
+        ctx.fillStyle = '#333';
+        ctx.beginPath();
+        ctx.arc(colX.avatar + 2, y - 5, 12, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else {
+      ctx.fillStyle = '#444';
+      ctx.beginPath();
+      ctx.arc(colX.avatar + 2, y - 5, 12, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Name
+    ctx.font = '13px monospace';
+    const name = e.username || 'Anonymous';
+    const displayName = name.length > 16 ? name.slice(0, 15) + '..' : name;
+    ctx.fillStyle = isMe ? '#ffd700' : '#ccc';
+    ctx.fillText(displayName, colX.name, y);
+
+    // Score
+    ctx.textAlign = 'right';
+    ctx.fillStyle = isMe ? '#ffd700' : '#0ff';
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText(String(e.score), colX.score + 50, y);
+
+    // Combo
+    ctx.fillStyle = isMe ? '#ffd700' : '#aaa';
+    ctx.font = '13px monospace';
+    ctx.fillText(`x${e.bestCombo}`, colX.combo + 40, y);
+
+    // Date
+    ctx.fillStyle = '#666';
+    ctx.fillText(formatLeaderboardDate(e.date), colX.date, y);
+
+    // Highlight bar for current player
+    if (isMe) {
+      ctx.save();
+      ctx.globalAlpha = 0.12;
+      ctx.fillStyle = '#ffd700';
+      ctx.fillRect(cx - tableW / 2 + 4, y - 18, tableW - 8, rowH);
+      ctx.restore();
+    }
+  }
+
+  // Save button / status area
+  const btnY = headY + 18 + top10.length * rowH + 10;
+  ctx.textAlign = 'center';
+  ctx.font = '14px monospace';
+
+  if (scoreSaved) {
+    ctx.fillStyle = '#4a4';
+    ctx.fillText('\u2713 Saved!', cx, btnY);
+  } else if (!githubUsername) {
+    ctx.fillStyle = '#666';
+    ctx.fillText('Enter username to save score', cx, btnY);
+  } else if (scoreQualifies(score)) {
+    // Draw a clickable-looking button
+    const btnW = 220;
+    const btnH = 28;
+    ctx.fillStyle = '#1a3a1a';
+    ctx.strokeStyle = '#4a4';
+    ctx.lineWidth = 1;
+    ctx.fillRect(cx - btnW / 2, btnY - 18, btnW, btnH);
+    ctx.strokeRect(cx - btnW / 2, btnY - 18, btnW, btnH);
+    ctx.fillStyle = '#4f4';
+    ctx.fillText('Save to Leaderboard', cx, btnY);
+    // Store button bounds for click detection
+    drawGameOverLeaderboard._saveBtn = {
+      x: cx - btnW / 2, y: btnY - 18, w: btnW, h: btnH
+    };
+  } else {
+    ctx.fillStyle = '#666';
+    ctx.fillText('Score doesn\'t qualify for top 10', cx, btnY);
+  }
+
+  ctx.restore();
+}
+drawGameOverLeaderboard._saveBtn = null;
 
 function drawCameraSetupScreen() {
   ctx.fillStyle = "#111";
@@ -898,7 +1239,7 @@ function drawGameOver() {
   ctx.shadowColor = "#ff0044";
   ctx.shadowBlur = 25;
   ctx.fillStyle = "#fff";
-  ctx.fillText("GAME OVER", cx, cy - 100);
+  ctx.fillText("GAME OVER", cx, 60);
   ctx.shadowBlur = 0;
 
   if (isNewHighScore) {
@@ -906,22 +1247,34 @@ function drawGameOver() {
     ctx.shadowColor = "#ffd700";
     ctx.shadowBlur = 20;
     ctx.fillStyle = "#ffd700";
-    ctx.fillText("NEW HIGH SCORE!", cx, cy - 55);
+    ctx.fillText("NEW HIGH SCORE!", cx, 105);
     ctx.shadowBlur = 0;
   }
 
   ctx.font = "bold 48px monospace";
   ctx.fillStyle = "#0ff";
-  ctx.fillText(String(score), cx, cy - 20);
+  ctx.fillText(String(score), cx, 145);
 
   ctx.font = "22px monospace";
   ctx.fillStyle = "#aaa";
-  ctx.fillText(`Peak combo: x${peakCombo}`, cx, cy + 35);
-  ctx.fillText(`Survived: ${Math.floor(gameTime)}s`, cx, cy + 65);
+  ctx.fillText(`Peak combo: x${peakCombo}`, cx, 185);
+  ctx.fillText(`Survived: ${Math.floor(gameTime)}s`, cx, 215);
 
+  // Show username input on game over too
+  usernameWrap.style.display = 'flex';
+  usernameWrap.style.top = `${240}px`;
+
+  drawGameOverLeaderboard();
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
   ctx.font = "24px monospace";
   ctx.fillStyle = "#0ff";
-  ctx.fillText("Click to play again", cx, cy + 130);
+  const bottomY = canvas.height - 30;
+  ctx.fillText("Click to play again", cx, bottomY);
+  ctx.restore();
+
   ctx.restore();
 }
 
@@ -996,6 +1349,7 @@ function gameLoop(timestamp) {
 
   switch (state) {
     case State.LOADING:
+      usernameWrap.style.display = 'none';
       drawLoadingScreen();
       break;
 
@@ -1004,10 +1358,12 @@ function gameLoop(timestamp) {
       break;
 
     case State.CAMERA:
+      usernameWrap.style.display = 'none';
       drawCameraSetupScreen();
       break;
 
     case State.CALIBRATION: {
+      usernameWrap.style.display = 'none';
       // Check for grab transitions
       for (let i = 0; i < detectedHands.length; i++) {
         if (detectedHands[i].justGrabbed) calibGrabs++;
@@ -1022,6 +1378,7 @@ function gameLoop(timestamp) {
     }
 
     case State.COUNTDOWN: {
+      usernameWrap.style.display = 'none';
       const elapsed = (performance.now() - countdownStart) / 1000;
       if (elapsed > 3.6) {
         state = State.PLAYING;
@@ -1032,6 +1389,7 @@ function gameLoop(timestamp) {
     }
 
     case State.PLAYING: {
+      usernameWrap.style.display = 'none';
       // Timing
       gameTime += (1 / 60) * dt * timeScale;
       if (slowMoTimer > 0) {
@@ -1087,6 +1445,8 @@ function gameLoop(timestamp) {
           if (peakCombo > highCombo) highCombo = peakCombo;
           try { localStorage.setItem('ninjaHands_highScore', JSON.stringify({ score: highScore, combo: highCombo })); } catch(e) {}
         }
+        scoreSaved = false;
+        drawGameOverLeaderboard._saveBtn = null;
         break;
       }
 
@@ -1192,11 +1552,27 @@ async function startCamera() {
 }
 
 // Click handler
-document.addEventListener("click", () => {
+document.addEventListener("click", (e) => {
+  // Don't process game clicks when clicking the input
+  if (e.target === githubInput || e.target === avatarPreview) return;
+
   ensureAudio();
   if (state === State.READY) {
     startCamera();
   } else if (state === State.GAMEOVER) {
+    // Check if clicking the save button
+    const btn = drawGameOverLeaderboard._saveBtn;
+    if (btn && !scoreSaved && githubUsername && scoreQualifies(score)) {
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      if (mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h) {
+        saveScore();
+        return;
+      }
+    }
+    scoreSaved = false;
+    drawGameOverLeaderboard._saveBtn = null;
     resetGame();
     state = State.COUNTDOWN;
     countdownStart = performance.now();
